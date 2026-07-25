@@ -1,0 +1,281 @@
+// EBMS Data Model — aligned to SOAR Section 11 (Data and Information Architecture)
+// and Appendix C (Bid Status Lifecycle)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ACCOUNTING_OFFICER
+  OVERSIGHT_UNIT
+  PROCUREMENT_UNIT
+  USER_DEPARTMENT
+  COMMITTEE_CHAIR
+  COMMITTEE_MEMBER
+  COMMITTEE_SECRETARY
+  OPENING_PANEL
+  AUDITOR
+  SYSTEM_ADMIN
+  BIDDER
+}
+
+enum EnvelopeType {
+  SINGLE
+  TECHNICAL
+  FINANCIAL
+}
+
+enum ProcurementStatus {
+  DRAFT
+  INTERNAL_REVIEW
+  APPROVED_FOR_PUBLICATION
+  PUBLISHED
+  CLARIFICATION_PERIOD
+  SUBMISSION_OPEN
+  CLOSED
+  TECHNICAL_OPENING
+  COMPLIANCE_EVALUATION
+  TECHNICAL_EVALUATION
+  TECHNICAL_OUTCOME_APPROVED
+  FINANCIAL_OPENING
+  FINANCIAL_EVALUATION
+  AWARD_PENDING_APPROVAL
+  AWARD_PUBLISHED
+  COOLING_OFF
+  COMPLAINT_HOLD
+  READY_FOR_CONTRACT
+  CANCELLED
+  ARCHIVED
+}
+
+enum SubmissionStatus {
+  SUBMITTED
+  REPLACED
+  WITHDRAWN
+  LATE_REJECTED
+}
+
+enum EvaluationStage {
+  COMPLIANCE
+  TECHNICAL
+  FINANCIAL
+}
+
+enum ComplaintStatus {
+  RECEIVED
+  UNDER_REVIEW
+  UPHELD
+  DISMISSED
+  ESCALATED
+}
+
+model User {
+  id            String   @id @default(uuid())
+  name          String
+  email         String   @unique
+  passwordHash  String
+  role          UserRole
+  department    String?
+  active        Boolean  @default(true)
+  mfaEnabled    Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  bidder        Bidder?  @relation(fields: [bidderId], references: [id])
+  bidderId      String?
+
+  createdProcurements   Procurement[]      @relation("CreatedBy")
+  committeeMemberships  CommitteeMember[]
+  evaluations           Evaluation[]
+  submissions           Submission[]
+  documentsUploaded     Document[]
+  communicationsSent    Communication[]
+  auditLogs             AuditLog[]
+  openingConfirmations  OpeningConfirmation[]
+}
+
+model Bidder {
+  id                 String   @id @default(uuid())
+  companyName        String
+  registrationNumber String   @unique
+  ppraCode           String?
+  contactEmail       String
+  contactPhone       String?
+  verified           Boolean  @default(false)
+  suspended          Boolean  @default(false)
+  createdAt          DateTime @default(now())
+
+  users        User[]
+  submissions  Submission[]
+  evaluations  Evaluation[]
+  complaints   Complaint[]
+  awards       Award[]
+}
+
+model Procurement {
+  id              String            @id @default(uuid())
+  tenderNumber    String            @unique
+  title           String
+  category        String            // works | services | consultancy | supplies
+  method          String            // e.g. OPEN_DOMESTIC_BIDDING
+  envelopeType    EnvelopeType      @default(SINGLE)
+  estimatedValue  Decimal
+  fundingSource   String?
+  status          ProcurementStatus @default(DRAFT)
+
+  closingAt       DateTime?
+  openingAt       DateTime?
+  coolingOffExpiry DateTime?
+
+  createdBy       User    @relation("CreatedBy", fields: [createdById], references: [id])
+  createdById     String
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  documents        Document[]
+  communications    Communication[]
+  submissions       Submission[]
+  committee         EvaluationCommittee?
+  evaluations       Evaluation[]
+  awards            Award[]
+  complaints        Complaint[]
+  openingConfirmations OpeningConfirmation[]
+}
+
+model Document {
+  id            String   @id @default(uuid())
+  procurement   Procurement @relation(fields: [procurementId], references: [id])
+  procurementId String
+  name          String
+  type          String   // BIDDING_PACKAGE | ADDENDUM | CLARIFICATION | OTHER
+  version       Int      @default(1)
+  filePath      String
+  sha256Hash    String
+  uploadedBy    User     @relation(fields: [uploadedById], references: [id])
+  uploadedById  String
+  createdAt     DateTime @default(now())
+}
+
+model Communication {
+  id            String   @id @default(uuid())
+  procurement   Procurement @relation(fields: [procurementId], references: [id])
+  procurementId String
+  type          String   // QUESTION | CLARIFICATION | ADDENDUM | NOTICE
+  content       String
+  fromUser      User?    @relation(fields: [fromUserId], references: [id])
+  fromUserId    String?
+  isPublic      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+}
+
+model Submission {
+  id            String   @id @default(uuid())
+  procurement   Procurement @relation(fields: [procurementId], references: [id])
+  procurementId String
+  bidder        Bidder   @relation(fields: [bidderId], references: [id])
+  bidderId      String
+  envelopeType  EnvelopeType
+  filePath      String   // path to AES-256-GCM encrypted blob
+  sha256Hash    String
+  version       Int      @default(1)
+  status        SubmissionStatus @default(SUBMITTED)
+  submittedBy   User     @relation(fields: [submittedById], references: [id])
+  submittedById String
+  submittedAt   DateTime @default(now())
+  receiptCode   String   @unique
+}
+
+model EvaluationCommittee {
+  id            String   @id @default(uuid())
+  procurement   Procurement @relation(fields: [procurementId], references: [id])
+  procurementId String   @unique
+  createdAt     DateTime @default(now())
+
+  members       CommitteeMember[]
+}
+
+model CommitteeMember {
+  id            String   @id @default(uuid())
+  committee     EvaluationCommittee @relation(fields: [committeeId], references: [id])
+  committeeId   String
+  user          User     @relation(fields: [userId], references: [id])
+  userId        String
+  role          String   // CHAIR | MEMBER | SECRETARY
+  conflictDeclared Boolean @default(false)
+  confidentialityAccepted Boolean @default(false)
+}
+
+// Records confirmations from opening panel members. Decryption of a sealed
+// envelope is only permitted once the quorum threshold (see config) of
+// distinct panel members have confirmed presence — simulating multi-person
+// control over the decryption key (SOAR 7.8 / 8.2).
+model OpeningConfirmation {
+  id            String   @id @default(uuid())
+  procurement   Procurement @relation(fields: [procurementId], references: [id])
+  procurementId String
+  user          User     @relation(fields: [userId], references: [id])
+  userId        String
+  envelopeType  EnvelopeType
+  confirmedAt   DateTime @default(now())
+
+  @@unique([procurementId, userId, envelopeType])
+}
+
+model Evaluation {
+  id            String   @id @default(uuid())
+  procurement   Procurement @relation(fields: [procurementId], references: [id])
+  procurementId String
+  bidder        Bidder   @relation(fields: [bidderId], references: [id])
+  bidderId      String
+  evaluator     User     @relation(fields: [evaluatorId], references: [id])
+  evaluatorId   String
+  stage         EvaluationStage
+  score         Decimal?
+  passed        Boolean?
+  comments      String?
+  createdAt     DateTime @default(now())
+}
+
+model Award {
+  id                String   @id @default(uuid())
+  procurement       Procurement @relation(fields: [procurementId], references: [id])
+  procurementId     String
+  winningBidder     Bidder   @relation(fields: [winningBidderId], references: [id])
+  winningBidderId   String
+  decisionDate      DateTime @default(now())
+  coolingOffExpiry  DateTime
+  contractConcluded Boolean  @default(false)
+}
+
+model Complaint {
+  id            String   @id @default(uuid())
+  procurement   Procurement @relation(fields: [procurementId], references: [id])
+  procurementId String
+  bidder        Bidder   @relation(fields: [bidderId], references: [id])
+  bidderId      String
+  grounds       String
+  reliefSought  String?
+  status        ComplaintStatus @default(RECEIVED)
+  decision      String?
+  createdAt     DateTime @default(now())
+}
+
+// Append-only. No update/delete route is ever exposed for this model.
+model AuditLog {
+  id            String   @id @default(uuid())
+  user          User?    @relation(fields: [userId], references: [id])
+  userId        String?
+  action        String
+  entityType    String
+  entityId      String?
+  previousValue Json?
+  newValue      Json?
+  ipAddress     String?
+  reason        String?
+  createdAt     DateTime @default(now())
+}
